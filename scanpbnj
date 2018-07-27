@@ -1,0 +1,1986 @@
+#!/usr/bin/perl
+
+eval 'exec /usr/bin/perl  -S $0 ${1+"$@"}'
+    if 0; # not running under some shell
+#
+# Copyright (C) 2005-2006 Joshua D. Abraham (jabra@ccs.neu.edu)
+#
+# This program is released under the terms of the GNU General Public License
+# (GPL), which is distributed with this software in the file "COPYING".
+# The GPL specifies the terms under which users may copy and use this software.
+#
+# PBNJ 2.0
+# (P)orts (B)anners N' (J)unk
+#
+# Author:   Joshua D. Abraham
+# Date:     March 15, 2006
+# Updated:  November 15, 2006
+# Version:  2.04
+#
+# ScanPBNJ - a program for running Nmap scans and storing the results in
+# a PBNJ 2.0 database.
+#
+
+use strict;
+use warnings;
+use Shell;
+use DBI;
+use Nmap::Parser;
+use Socket;
+use Net::hostent;
+use Sys::Hostname;
+use Getopt::Long;
+use FileHandle;
+use YAML;
+use File::Which;
+use Term::ANSIColor qw(:constants);
+use File::HomeDir;
+use POSIX;
+$Term::ANSIColor::AUTORESET = 1;
+
+use vars qw( $PROG );
+( $PROG = $0 ) =~ s/^.*[\/\\]//;    # Truncate calling path from the prog name
+
+my $AUTH    = 'Joshua D. Abraham';  # author
+my $VERSION = '2.04';               # version
+
+my $np = new Nmap::Parser;          # parser object
+
+my $type = 'help';                  # parse scan or file
+my @ipRange;                        # ip Address or ip range to scan
+my $iplist;                         # ip list file
+my $xmlFile;                        # xml file to parse
+my $Range     = '1-1025';           # port range to scan
+my $args      = "-vv -O -P0 ";      # scan args
+my $scantype  = "-sSV";             # default scantype
+my $cargs     = 'no';               # user changed args
+my $outputdir = '.';                # output database directory
+my $nmapPath  = which('nmap');      # nmap path
+my $interface = "";                 # default interface to perform scan
+my %options;                        # getopts hash
+my $dbh;                            # database connection
+my $dbconfig = 'config.yaml';       # database config
+my $database;                       # database file
+my $db;                             # db backend
+my $hostname;                       # db host ip
+my $port;                           # db port
+my $user;                           # db username
+my $passwd;                         # db password
+my $datadb;                         # results from the config of the db
+my $dir    = ".";                   # dir of the config for the db
+my $colors = 1;                     # print using colors
+my $diff   = 'version';
+$options{test}  = 0;                # testing flag
+$options{debug} = 0;                # debug flag
+my $configdir;
+
+#chown() that reports errors
+sub safe_chown {
+    my $uid  = shift;
+    my $gid  = shift;
+    my $file = shift;
+
+    if ( chown( $uid, $gid, $file ) != 1 ) {
+        error(    'Unable to change the owner of the file ' . $file . '.'
+                . "\n\n" );
+    }
+}
+
+if ( $^O eq 'MSWin32' || $^O =~ /cygwin/ ) {
+    $colors = 0;
+    require Win32;
+    import Win32;
+    Win32->import(qw(CSIDL_APPDATA));
+    my $dir = Win32::GetFolderPath( CSIDL_APPDATA() );
+    # 2.0
+    $configdir = $dir . "\\" . "pbnj-2.0";
+    if ( -e $configdir and -d $configdir ) {
+
+        if ( $options{test} > 2 ) {
+            print "$configdir exists\n";
+        }
+    }
+
+    else {
+        mkdir $configdir;
+        print "mkdir $configdir\n";
+    }
+    if ( !-e $dbconfig ) {
+        $dbconfig = "$configdir\\$dbconfig";
+
+        # check if the config exists in ~/.pbnj-2.0/config.yaml
+        if ( !-e $dbconfig ) {
+            open( CONFIG, ">$dbconfig" );
+            while (<DATA>) {
+                if ( defined($_) ) {
+                    print CONFIG $_;
+                }
+            }
+            close(CONFIG);
+            print "$dbconfig generated\n";
+        }
+    }
+
+}
+else {
+    $configdir = File::HomeDir->my_home;
+    my $tmpuser = $configdir;
+    $configdir .= "/.pbnj-2.0";
+    $tmpuser =~ s/home//;
+    $tmpuser =~ s/\///g;
+    my $uid = getpwnam($tmpuser);
+    my $gid = id("-g $tmpuser");
+    if ( !defined($gid) ) {
+        error("gid not defined\n");
+    }
+    if ( !defined($uid) ) {
+        error("uid not defined\n");
+    }
+
+    if ( -e $configdir and -d $configdir ) {
+        if ( $options{test} > 2 ) {
+            print "$configdir exists\n";
+        }
+    }
+
+    else {
+        umask 077;
+        mkdir $configdir;
+        print "mkdir $configdir\n";
+        safe_chown( $uid, $gid, $configdir );
+    }
+
+    # check if config exists in the current directory
+    if ( !-e $dbconfig ) {
+        $dbconfig = "$configdir/$dbconfig";
+
+        # check if the config exists in ~/.pbnj-2.0/config.yaml
+        if ( !-e $dbconfig ) {
+            umask 077;
+            open( CONFIG, ">$dbconfig" );
+            while (<DATA>) {
+                if ( defined($_) ) {
+                    print CONFIG $_;
+                }
+            }
+            close(CONFIG);
+            safe_chown( $uid, $gid, $dbconfig );
+            print "$dbconfig generated\n";
+        }
+    }
+}
+
+##############################################################################
+#
+# createMachinesTable: scalar -> scalar
+# creates the table for machines in the database
+#  mid INTEGER PRIMARY KEY,
+#
+##############################################################################
+sub createMachinesTable {
+    my $dbh            = shift;
+    my $auto_increment = "AUTO_INCREMENT";
+    my $mid_type;
+    if ( $db eq "SQLite" ) {
+        $auto_increment = "AUTOINCREMENT";
+        $mid_type       = "INTEGER PRIMARY KEY $auto_increment";
+    }
+    elsif ( $db eq "mysql" or $db eq "CSV" ) {
+        $mid_type = "INTEGER PRIMARY KEY";
+    }
+    elsif ( $db eq "Pg" ) {
+        $mid_type = "SERIAL PRIMARY KEY";
+    }
+    else {
+        print "db not supported\n";
+        exit 1;
+    }
+    eval {
+        $dbh->do(
+            "CREATE TABLE machines ( 
+            mid $mid_type,
+            ip TEXT,
+            host TEXT,
+            localh INTEGER,
+            os TEXT,
+            machine_created TEXT,
+            created_on TEXT)"
+        );
+    };
+    if ($@) {
+        return 0;
+    }
+    return 1;
+}
+
+##############################################################################
+#
+# createService: scalar -> scalar
+# creates the table for services in the database
+#
+##############################################################################
+sub createServicesTable {
+    my $dbh = shift;
+
+    #sid INTEGER PRIMARY KEY,
+    eval {
+        $dbh->do(
+            "CREATE TABLE services (
+            mid INTEGER,
+            service TEXT,
+            state TEXT,
+            port INTEGER,
+            protocol TEXT,
+            version TEXT,
+            banner TEXT,
+            machine_updated TEXT,
+            updated_on TEXT)"
+        );
+    };
+    if ($@) {
+        return 0;
+    }
+    return 1;
+}
+
+##############################################################################
+#
+# insertService: anoy hash -> scalar
+# inserts information about a service into the database
+#
+##############################################################################
+sub insertService {
+    my ($href) = @_;
+    die "insertService: mid not defined"     unless defined $href->{mid};
+    die "insertService: service not defined" unless defined $href->{service};
+    die "insertService: state not defined"   unless defined $href->{state};
+    die "insertService: port not defined"    unless defined $href->{port};
+    die "insertService: proto not defined"   unless defined $href->{proto};
+    die "insertService: ver not defined"     unless defined $href->{ver};
+    die "insertService: banner not defined"  unless defined $href->{banner};
+    die "insertService: updated not defined" unless defined $href->{updated};
+    die "insertService: machine_updated not defined"
+        unless defined $href->{machine_updated};
+
+    my $mid             = $href->{mid};
+    my $service         = $href->{service};
+    my $state           = $href->{state};
+    my $port            = $href->{port};
+    my $proto           = $href->{proto};
+    my $ver             = $href->{ver};
+    my $banner          = $href->{banner};
+    my $updated         = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+
+    my $insert
+        = $dbh->prepare('INSERT INTO services VALUES (?,?,?,?,?,?,?,?,?)');
+
+    my $success = 1;
+    $success &&= $insert->execute(
+        $mid,    $service,         $state,
+        $port,   $proto,           $ver,
+        $banner, $machine_updated, $updated
+    );
+    return $success;
+}
+
+##############################################################################
+#
+# setLocal: anoy hash -> scalar
+# set the localhost bit
+#
+##############################################################################
+sub setLocal {
+    my ($href) = @_;
+    die "setLocal: ip not defined"       unless defined $href->{ip};
+    die "setLocal: hostname not defined" unless defined $href->{hostname};
+
+    my $ip       = $href->{ip};
+    my $hostname = $href->{hostname};
+    my $localh   = 0;
+
+    if ( $hostname =~ m/localhost/ and $ip eq "127.0.0.1" ) {
+        if ( $options{test} > 0 or $options{debug} > 1 ) {
+            print "localhost scan\n";
+        }
+        $localh = 1;
+    }
+
+    return $localh;
+}
+
+##############################################################################
+#
+# insertMachine: anoy hash -> scalar
+# inserts information about a machine into the database
+#
+##############################################################################
+sub insertMachine {
+    my ($href) = @_;
+    die "insertMachine: ip not defined"      unless defined $href->{ip};
+    die "insertMachine: host not defined"    unless defined $href->{host};
+    die "insertMachine: localh not defined"  unless defined $href->{localh};
+    die "insertMachine: os not defined"      unless defined $href->{os};
+    die "insertMachine: created not defined" unless defined $href->{created};
+    die "insertMachine: machine_created not defined"
+        unless defined $href->{machine_created};
+
+    my $ip              = $href->{ip};
+    my $host            = $href->{host};
+    my $localh          = $href->{localh};
+    my $os              = $href->{os};
+    my $created         = $href->{created};
+    my $machine_created = $href->{machine_created};
+    
+    my $sth = $dbh->selectrow_hashref("select max(mid) from machines");
+   
+    my $mid;
+    if ($db eq 'Pg') {
+    	$mid = $sth->{'max'} ;
+    }
+    else {
+        $mid = $sth->{'max(mid)'};
+    }
+    # new mid needs to be 1 more than the max
+    $mid++;
+    
+    my $insert = $dbh->prepare(
+       'INSERT INTO machines VALUES (?,?,?,?,?,?,?)');
+    my $success = 1;
+    $success &&= $insert->execute( $mid, $ip, $host, $localh, $os,
+        $machine_created, $created );
+    
+    return $mid;
+}
+
+##############################################################################
+#
+# flushTables: ->
+# flush the machines and services tables
+#
+##############################################################################
+sub flushTables {
+    print "flushing tables\n";
+    $dbh->do("DROP TABLE machines");
+    $dbh->do("DROP TABLE services");
+}
+
+##############################################################################
+#
+# addHost: anoy hash -> scalar
+# insert a host only if it is uniq
+#
+##############################################################################
+sub addHost {
+    my ($href) = @_;
+    die "addHost: os not defined"      unless defined $href->{os};
+    die "addHost: session not defined" unless defined $href->{session};
+    die "addHost: host not defined"    unless defined $href->{host};
+
+    my $os      = $href->{os};
+    my $session = $href->{session};    #a Nmap::Parser::Session object
+    my $host    = $href->{host};
+
+    my $mid;
+    my $ip              = $host->addr;
+    my $machine_created = $session->finish_time();
+    my $human_time      = localtime($machine_created);
+    my $uniqhost        = 0;
+
+    my $hostname = $host->hostname;
+    my $localh   = setLocal( { ip => $ip, hostname => $host->hostname } );
+
+    my $uniq = $dbh->selectall_arrayref(
+        "select mid from
+                machines WHERE ip='$ip' AND os='$os' AND host='$hostname'
+                AND localh='$localh'"
+    );
+
+    if ( $options{test} > 1 ) {
+        print "uniq is $uniq\n";
+    }
+    foreach my $uniqtmp (@$uniq) {
+        my ($midtmp) = @$uniqtmp;
+        $uniqhost = 1;
+        $mid      = $midtmp;
+        if ( $options{test} > 0 or $options{debug} > 1 ) {
+            print "non unique host\n";
+            print "mid shift is $mid\n";
+        }
+    }
+
+    if ( $uniqhost eq 0 ) {
+        if ( $colors eq 1 ) {
+            print BOLD GREEN "Inserting Machine\n";
+        }
+        else {
+            print "Inserting Machine\n";
+        }
+        $mid = insertMachine(
+            {   ip              => $ip,
+                host            => $hostname,
+                localh          => $localh,
+                os              => $os,
+                created         => $human_time,
+                machine_created => $machine_created
+            }
+        );
+        if ( $options{test} > 0 or $options{debug} > 1 ) {
+            ;
+            print "mid is $mid\n";
+        }
+    }
+    else {
+        print "Machine is already in the database\n";
+        print "Checking Current Services\n";
+    }
+
+    return ( $mid, $uniqhost );
+}
+
+##############################################################################
+#
+# insertServiceDB: anoy hash ->
+# take information about a services from the database and insert it as
+# as being down
+#
+##############################################################################
+sub insertServiceDB {
+    my ($href) = @_;
+    die "insertServiceDB: mid not defined"   unless defined $href->{mid};
+    die "insertServiceDB: port not defined"  unless defined $href->{port};
+    die "insertServiceDB: state not defined" unless defined $href->{state};
+    die "insertServiceDB: proto not defined" unless defined $href->{proto};
+    die "insertSerciceDB: updated not defined"
+        unless defined $href->{updated};
+    die "insertSerciceDB: machine_updated not defined"
+        unless defined $href->{machine_updated};
+
+    my $mid             = $href->{mid};
+    my $port            = $href->{port};
+    my $state           = $href->{state};
+    my $proto           = $href->{proto};
+    my $human_time      = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+
+    my $uniq_service = $dbh->selectall_arrayref(
+        "SELECT
+                    service,version,protocol,banner
+                    FROM services WHERE mid='$mid' AND port='$port' 
+                    AND protocol='$proto' AND state='up' 
+                    ORDER BY machine_updated DESC"
+    );
+    my ( $version, $service, $banner, $uniqservice );
+    foreach my $uniqtmp (@$uniq_service) {
+        ( $service, $version, $proto, $banner ) = @$uniqtmp;
+
+        #print "service is $service\n";
+    }
+    if ( $colors eq 1 ) {
+        print BOLD RED "\t! Service $port:$proto $service is down\n";
+    }
+    else {
+        print "\t! Service $port:$proto $service is down\n";
+    }
+
+    insertService(
+        {   mid             => $mid,
+            service         => $service,
+            port            => $port,
+            proto           => $proto,
+            ver             => $version,
+            state           => $state,
+            banner          => $banner,
+            updated         => $human_time,
+            machine_updated => $machine_updated
+        }
+    );
+}
+
+##############################################################################
+#
+# insertServiceScan: anoy hash ->
+# take information about a services from the scan and insert it as
+# as being up
+#
+##############################################################################
+sub insertServiceScan {
+    my ($href) = @_;
+    die "insertServiceScan: host not defined"  unless defined $href->{host};
+    die "insertServiceScan: mid not defined"   unless defined $href->{mid};
+    die "insertServiceScan: port not defined"  unless defined $href->{port};
+    die "insertServiceScan: state not defined" unless defined $href->{state};
+    die "insertServiceScan: proto not defined" unless defined $href->{proto};
+    die "insertServiceScan: change not defined"
+        unless defined $href->{change};
+    die "insertSerciceScan: updated not defined"
+        unless defined $href->{updated};
+    die "insertSerciceScan: machine_updated not defined"
+        unless defined $href->{machine_updated};
+
+    my $host            = $href->{host};
+    my $mid             = $href->{mid};
+    my $port            = $href->{port};
+    my $state           = $href->{state};
+    my $proto           = $href->{proto};
+    my $human_time      = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+    my $change          = $href->{change};
+    my $service;
+
+    if ( $proto eq "tcp" ) {
+        $service = $host->tcp_service($port);
+    }
+    else {
+        $service = $host->udp_service($port);
+    }
+
+    my $name    = "unknown name";
+    my $product = "unknown product";
+    my $version = "unknown version";
+
+    if ( defined( $service->name ) ) {
+        $name = $service->name;
+    }
+    if ( defined( $service->version ) ) {
+        $version = $service->version;
+    }
+    if ( defined( $service->product ) ) {
+        $product = $service->product;
+    }
+    if ( $change == 1 ) {
+        if ( $colors == 1 ) {
+            print BOLD GREEN "\tInserting Service on $port:$proto $name\n";
+        }
+        else {
+            print "\tInserting Service on $port:$proto $name\n";
+        }
+    }
+
+    insertService(
+        {   mid             => $mid,
+            service         => $name,
+            port            => $port,
+            proto           => $proto,
+            ver             => $version,
+            state           => $state,
+            banner          => $product,
+            updated         => $human_time,
+            machine_updated => $machine_updated
+        }
+    );
+}
+
+##############################################################################
+#
+# cmpService: anoy hash -> scalar
+# compare the service in the database and the service from the scan.
+# Note:
+# If the service is up the database & is not in the scan then the state is down.
+# If the service is not in the database & is in the scan then the state is up.
+#
+##############################################################################
+sub cmpService {
+    my ($href) = @_;
+    die "cmpService: host not defined"    unless defined $href->{host};
+    die "cmpService: mid not defined"     unless defined $href->{mid};
+    die "cmpService: port not defined"    unless defined $href->{port};
+    die "cmpService: state not defined"   unless defined $href->{state};
+    die "cmpService: proto not defined"   unless defined $href->{proto};
+    die "cmpService: updated not defined" unless defined $href->{updated};
+    die "cmpService: machine_updated not defined"
+        unless defined $href->{machine_updated};
+    die "cmpService: db_updated not defined"
+        unless defined $href->{db_updated};
+    die "cmpService: db_machine_updated not defined"
+        unless defined $href->{db_machine_updated};
+
+    my $host               = $href->{host};
+    my $mid                = $href->{mid};
+    my $human_time         = $href->{updated};
+    my $machine_updated    = $href->{machine_updated};
+    my $state              = $href->{state};
+    my $port               = $href->{port};
+    my $proto              = $href->{proto};
+    my $db_updated         = $href->{db_updated};
+    my $db_machine_updated = $href->{db_machine_updated};
+
+    my $service;
+    if ( $proto eq "tcp" ) {
+        $service = $host->tcp_service($port);
+    }
+    elsif ( $proto eq "udp" ) {
+        $service = $host->udp_service($port);
+    }
+    else {
+        print "error in $proto\n";
+        exit 1;
+    }
+
+    my $banner_from_scan  = "unknown product";
+    my $version_from_scan = "unknown version";
+    my $port_from_scan    = $service->port;
+
+    my $service_name_from_scan = "unknown service";
+    if ( defined( $service->name ) ) {
+        $service_name_from_scan = $service->name;
+    }
+    if ( $options{test} eq 1 ) {
+        print "service name from scan is $service_name_from_scan\n";
+    }
+    if ( defined( $service->version ) ) {
+        $version_from_scan = $service->version;
+        if ( $options{test} > 2 ) {
+            print "version from scan is $version_from_scan\n";
+        }
+    }
+    if ( defined( $service->product ) ) {
+        $banner_from_scan = $service->product;
+        if ( $options{test} > 2 ) {
+            print "banner from scan is $banner_from_scan\n";
+        }
+    }
+
+    my ( $version_from_db, $service_name_from_db, $banner_from_db );
+
+    # note the version banner and service name are the only elements
+    # of the service that we can comparing
+    my $uniq_service = $dbh->selectall_arrayref(
+        "SELECT
+                    service,version,banner FROM services
+                    WHERE mid='$mid' AND
+                    port='$port' AND state='$state' 
+                    AND protocol='$proto' 
+                    AND updated_on='$db_updated' 
+                    AND machine_updated='$db_machine_updated'"
+    );
+
+    foreach my $uniqtmp (@$uniq_service) {
+        my ( $nametmp, $vertmp, $bantmp ) = @$uniqtmp;
+        $service_name_from_db = $nametmp;
+        $version_from_db      = $vertmp;
+        $banner_from_db       = $bantmp;
+    }
+    if ( $options{test} > 1 ) {
+        print "state is $state\n";
+        print
+            "comparing service $service_name_from_db and $service_name_from_scan\n";
+        print "comparing version $version_from_db and $version_from_scan\n";
+        print "comparing banner $banner_from_db and $banner_from_scan\n";
+    }
+    if (   $diff eq "banner"
+        && $version_from_db      eq $version_from_scan
+        && $banner_from_db       eq $banner_from_scan
+        && $service_name_from_db eq $service_name_from_scan )
+    {
+        print
+            "\t= $service_name_from_db:$port is ($version_from_db) $banner_from_db\n";
+        return 1;
+    }
+    elsif ($diff ne "banner"
+        && $version_from_db      eq $version_from_scan
+        && $service_name_from_db eq $service_name_from_scan )
+    {
+        print
+            "\t= $service_name_from_db:$port is ($version_from_db) $banner_from_db\n";
+        return 1;
+    }
+    else {
+        if ( $colors == 1 ) {
+            print BOLD YELLOW
+                "\t! $service_name_from_db:$port is ($version_from_db) $banner_from_db\n";
+        }
+        else {
+            print
+                "\t! $service_name_from_db:$port is ($version_from_db) $banner_from_db\n";
+        }
+        if ( $service_name_from_db ne $service_name_from_scan ) {
+            if ( $colors == 1 ) {
+                print BOLD YELLOW
+                    " Service Name was \"$service_name_from_db\" changed to \"$service_name_from_scan\"\n";
+            }
+            else {
+                print
+                    " Service Name was \"$service_name_from_db\" changed to \"$service_name_from_scan\"\n";
+            }
+
+        }
+        elsif ( $version_from_db ne $version_from_scan ) {
+            if ( $colors == 1 ) {
+                print BOLD YELLOW
+                    " Version was \"$version_from_db\" changed to \"$version_from_scan\"\n";
+            }
+            else {
+                print
+                    " Version was \"$version_from_db\" changed to \"$version_from_scan\"\n";
+            }
+
+        }
+        elsif ( $diff eq 'banner' and $banner_from_db ne $banner_from_scan ) {
+            if ( $colors == 1 ) {
+                print BOLD YELLOW
+                    " Banner was \"$banner_from_db\" changed to \"$banner_from_scan\"\n";
+            }
+            else {
+                print
+                    " Banner was \"$banner_from_db\" changed to \"$banner_from_scan\"\n";
+            }
+        }
+        else {
+            print "version or banner difference\n";
+        }
+
+        # set time to earlier so insert works after old verison is down
+        $machine_updated = scalar($machine_updated);
+        $machine_updated -= 1;
+        insertService(
+            {   mid             => $mid,
+                service         => $service_name_from_db,
+                port            => $port,
+                proto           => $proto,
+                ver             => $version_from_db,
+                state           => 'down',
+                banner          => $banner_from_db,
+                updated         => $human_time,
+                machine_updated => $machine_updated,
+            }
+        );
+        return 0;
+    }
+    return 1;
+}
+##############################################################################
+#
+# setAndInsertService: anoy hash -> scalar
+# store all the services in the scan into the database
+#
+##############################################################################
+sub setAndInsertService {
+    my ($href) = @_;
+    die "setAndInsertService: mid not defined" unless defined $href->{mid};
+    die "setAndInsertService: proto not defined"
+        unless defined $href->{proto};
+    die "setAndInsertService: service not defined"
+        unless defined $href->{service};
+    die "setAndInsertService: updated not defined"
+        unless defined $href->{updated};
+    die "setAndInsertService: machine_updated not defined"
+        unless defined $href->{machine_updated};
+    my $mid             = $href->{mid};
+    my $human_time      = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+    my $service         = $href->{service};
+    my $proto           = $href->{proto};
+
+    my $state = 'up';
+
+    my $product_from_scan = "unknown product";
+    my $version_from_scan = "unknown version";
+    my $port_from_scan    = $service->port;
+    my $name_from_scan    = "unknown service";
+
+    if ( defined( $service->name ) ) {
+        $name_from_scan = $service->name;
+    }
+    if ( defined( $service->version ) ) {
+        $version_from_scan = $service->version;
+    }
+    if ( defined( $service->product ) ) {
+        $product_from_scan = $service->product;
+    }
+    print "Inserting Service on $port_from_scan:$proto $name_from_scan\n";
+    insertService(
+        {   mid             => $mid,
+            service         => $name_from_scan,
+            port            => $port_from_scan,
+            proto           => $proto,
+            ver             => $version_from_scan,
+            state           => $state,
+            banner          => $product_from_scan,
+            updated         => $human_time,
+            machine_updated => $machine_updated
+        }
+    );
+}
+
+##############################################################################
+#
+# storeEverything: anoy hash -> scalar
+# store all the services in the scan into the database
+#
+##############################################################################
+sub storeEverything {
+    my ($href) = @_;
+    die "storeEverything: host not defined" unless defined $href->{host};
+    die "storeEverything: mid not defined"  unless defined $href->{mid};
+    die "storeEverything: updated not defined"
+        unless defined $href->{updated};
+    die "storeEverything: machine_updated not defined"
+        unless defined $href->{machine_updated};
+
+    my $host            = $href->{host};
+    my $mid             = $href->{mid};
+    my $human_time      = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+
+    my $state;
+
+    # $port is up in the database
+    # store all the services running on tcp ports
+    foreach ( $host->tcp_ports('open') ) {
+        my $state = $host->tcp_port_state($_);
+        if ( $options{test} eq 1 ) {
+            print "state is $state on port $_\n";
+        }
+        next if ( $state ne "open" );
+
+        my $service = $host->tcp_service($_);
+        next if ( !defined($service) );
+
+        #my $uniqservice = 1;
+        setAndInsertService(
+            {   proto           => 'tcp',
+                service         => $service,
+                mid             => $mid,
+                updated         => $human_time,
+                machine_updated => $machine_updated
+            }
+        );
+    }
+
+    # store all the services running on tcp ports
+    foreach ( $host->udp_ports('open') ) {
+        my $state = $host->udp_port_state($_);
+        if ( $options{test} eq 1 ) {
+            print "in udp loop\n";
+            print "state is $state on port $_\n";
+        }
+        next if ( $state ne "open" );
+
+        my $service = $host->udp_service($_);
+        next if ( !defined($service) );
+        setAndInsertService(
+            {   proto           => 'udp',
+                service         => $service,
+                mid             => $mid,
+                updated         => $human_time,
+                machine_updated => $machine_updated
+            }
+        );
+    }
+
+    return 0;
+}
+
+##############################################################################
+#
+# sortDB: anoy hash -> hash
+# sort the database based on the time
+#
+##############################################################################
+sub sortDB {
+    my ($href) = @_;
+    die "sortDB: mid not defined"     unless defined $href->{mid};
+    die "sortDB: updated not defined" unless defined $href->{updated};
+    die "sortDB: machine_updated not defined"
+        unless defined $href->{machine_updated};
+
+    my $mid             = $href->{mid};
+    my $human_time      = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+
+    my ( $port, $service, $banner, $state, $state_db );
+
+    # determines all ports that are in the database and not in the scan
+    # thus we assume these services went down
+    # may 30 added limit 1
+    my ( %port_db, %seen_ports, $scan_state, $scan_proto );
+    my $ports_db_ref = $dbh->selectall_arrayref(
+        "SELECT
+                port,state,protocol,machine_updated,updated_on FROM
+                services WHERE mid='$mid' ORDER BY machine_updated DESC "
+    );
+    foreach my $key (@$ports_db_ref) {
+        my ( $port, $state, $proto, $machine_updated, $updated ) = @$key;
+        if ( !$port_db{$port}{machine_updated} ) {
+            $port_db{$port}{machine_updated} = $machine_updated;
+            $port_db{$port}{updated}         = $updated;
+            $port_db{$port}{port}            = $port;
+            $port_db{$port}{state}           = $state;
+            $port_db{$port}{proto}           = $proto;
+        }
+        else {
+
+            #print "not less than and exists\n";
+        }
+    }
+    return %port_db;
+}
+
+##############################################################################
+#
+# setDown: anoy hash ->
+# remove all services on a given protocol as the host has no ports on
+# this protocol.
+#
+##############################################################################
+sub setDown {
+    my ($href) = @_;
+    die "setDown: mid not defined"     unless defined $href->{mid};
+    die "setDown: host not defined"    unless defined $href->{host};
+    die "setDown: proto not defined"   unless defined $href->{proto};
+    die "setDown: portdb not defined"  unless defined $href->{portdb};
+    die "setDown: updated not defined" unless defined $href->{updated};
+    die "setDown: machine_updated not defined"
+        unless defined $href->{machine_updated};
+
+    my $host            = $href->{host};
+    my $human_time      = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+    my $mid             = $href->{mid};
+    my $proto           = $href->{proto};
+    my $db_ref          = $href->{portdb};
+    my %portdb          = %{$db_ref};
+
+    if ( $options{test} > 0 ) {
+        print "protocol is $proto\n";
+    }
+    my ( $scan_state, %seen_ports );
+    foreach my $port ( sort { $a cmp $b } keys %portdb ) {
+
+        #print "key is $port\n";
+        if ( $options{test} eq 1 ) {
+            print $portdb{$port}{state} . " and $port\n";
+            print "port db $port proto $proto\n";
+        }
+        $scan_state = "down";
+        if ( $options{test} eq 1 ) {
+            print "scan thinks the status of $port is $scan_state\n";
+            print "state is " . $portdb{$port}{state} . "\n";
+        }
+        if (   $scan_state eq "down"
+            && $portdb{$port}{'state'} eq "up"
+            && $portdb{$port}{proto}
+            && $portdb{$port}{proto} eq $proto )
+        {
+            insertServiceDB(
+                {   mid             => $mid,
+                    port            => $port,
+                    state           => $scan_state,
+                    proto           => $proto,
+                    updated         => $human_time,
+                    machine_updated => $machine_updated
+                }
+            );
+            if ( $options{test} eq 1 ) {
+                print "pulling data about service from database\n";
+            }
+        }
+    }
+}
+
+##############################################################################
+#
+# cmpAndInsert: anoy hash ->
+# add service changes to the database
+#
+##############################################################################
+sub cmpAndInsert {
+    my ($href) = @_;
+    die "cmpAndInsert: mid not defined"     unless defined $href->{mid};
+    die "cmpAndInsert: host not defined"    unless defined $href->{host};
+    die "cmpAndInsert: proto not defined"   unless defined $href->{proto};
+    die "cmpAndInsert: portdb not defined"  unless defined $href->{portdb};
+    die "cmpAndInsert: updated not defined" unless defined $href->{updated};
+    die "cmpAndInsert: machine_updated not defined"
+        unless defined $href->{machine_updated};
+
+    my $host            = $href->{host};
+    my $human_time      = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+    my $mid             = $href->{mid};
+    my $proto           = $href->{proto};
+    my $db_ref          = $href->{portdb};
+    my %portdb          = %{$db_ref};
+
+    if ( $options{test} eq 1 or $options{debug} eq 1 ) {
+        print "protocol is $proto\n";
+    }
+    my ( $scan_state, %seen_ports );
+    foreach my $port ( sort { $a cmp $b } keys %portdb ) {
+        if ( $options{test} eq 1 ) {
+            print $portdb{$port}{state} . " and $port\n";
+            print "port db $port proto $proto\n";
+        }
+        my $tmp;
+        if ( $proto eq "tcp" ) {
+            $tmp = $host->tcp_port_state($port);
+        }
+        elsif ( $proto eq "udp" ) {
+            $tmp = $host->udp_port_state($port);
+        }
+        else {
+            next;
+        }
+
+        $seen_ports{$port} = "up";
+        if ($tmp) {
+            $scan_state = "up";
+        }
+        else {
+            $scan_state = "down";
+        }
+        if ( $options{test} eq 1 ) {
+            print "scan thinks the status of $port is $scan_state\n";
+            print "state is " . $portdb{$port}{state} . "\n";
+        }
+        if (   $portdb{$port}{state} eq "up"
+            && $scan_state eq "up"
+            && $portdb{$port}{proto}
+            && $portdb{$port}{proto} eq $proto )
+        {
+            if ( $options{test} eq 1 ) {
+                print "states are both up\n";
+                print "checking versions and banners\n";
+            }
+            my $db_updated         = $portdb{$port}{updated};
+            my $db_machine_updated = $portdb{$port}{machine_updated};
+            my $cmp                = cmpService(
+                {   mid                => $mid,
+                    host               => $host,
+                    port               => $port,
+                    state              => $scan_state,
+                    proto              => $proto,
+                    updated            => $human_time,
+                    machine_updated    => $machine_updated,
+                    db_updated         => $db_updated,
+                    db_machine_updated => $db_machine_updated,
+                }
+            );
+            if ( $cmp eq 0 ) {
+                if ( $options{test} > 1 ) {
+                    print "port is $port\n";
+                    print "mark 1\n";
+                }
+                insertServiceScan(
+                    {   mid             => $mid,
+                        host            => $host,
+                        port            => $port,
+                        state           => $scan_state,
+                        proto           => $proto,
+                        updated         => $human_time,
+                        machine_updated => $machine_updated,
+                        change          => $cmp,
+                    }
+                );
+            }
+            else {
+                if ( $options{test} eq 1 ) {
+                    print "no difference in name or version or banner\n";
+                }
+            }
+        }
+        else {
+
+            #print "scan state is $scan_state\n";
+            #print "database state is $port_db{$port}{'state'}\n";
+            if (   $scan_state eq "down"
+                && $portdb{$port}{'state'} eq "up"
+                && $portdb{$port}{proto}
+                && $portdb{$port}{proto} eq $proto )
+            {
+                insertServiceDB(
+                    {   mid             => $mid,
+                        port            => $port,
+                        state           => $scan_state,
+                        proto           => $proto,
+                        updated         => $human_time,
+                        machine_updated => $machine_updated
+                    }
+                );
+                if ( $options{test} eq 1 ) {
+                    print "pulling data about service from database\n";
+                }
+            }
+            elsif ($scan_state eq "up"
+                && $portdb{$port}{'state'} eq "down"
+                && $portdb{$port}{proto}
+                && $portdb{$port}{proto} eq $proto )
+            {
+                if ( $options{test} > 1 ) {
+                    print "port is $port\n";
+                    print "mark 2\n";
+                }
+                insertServiceScan(
+                    {   host            => $host,
+                        mid             => $mid,
+                        port            => $port,
+                        state           => $scan_state,
+                        proto           => $proto,
+                        updated         => $human_time,
+                        machine_updated => $machine_updated,
+                        change          => 1,
+                    }
+                );
+                if ( $options{test} eq 1 ) {
+                    print "pulling data about service from scan\n";
+                }
+            }
+            else {
+                if (   $portdb{$port}{proto}
+                    && $portdb{$port}{proto} eq $proto )
+                {
+                    if ( $options{test} eq 1 ) {
+                        print "states are both down\n";
+                    }
+                }
+                else {
+                    if ( $options{test} > 1 ) {
+                        print "protocols are different\n";
+                    }
+                }
+            }
+        }
+        chomp( $portdb{$port}{updated} );
+
+        #print "\n$port_db{$port}{port} keys is $port\n";
+        #print "\n$port_db{$port}{state} keys is $port\n";
+        #print "\n$port_db{$port}{updated} keys is $port\n";
+    }
+
+    # bug for seen ports on different protocols
+
+    if ( $proto eq "tcp" ) {
+
+     # handles ports that are open in the scan and don't exist in the database
+        foreach ( $host->tcp_ports('open') ) {
+            my $tmptest = $host->tcp_port_state($_);
+            if ( $options{test} eq 1 ) {
+                print "state is $tmptest\n";
+            }
+            next if ( $tmptest ne "open" );
+
+            my $port_tmp = $_;
+            my $state_tmp;
+            if ( $seen_ports{$port_tmp} && $seen_ports{$port_tmp} eq "up" ) {
+                if ( $options{test} eq 1 ) {
+                    print "Port is already up\n";
+                }
+            }
+            else {
+                $state_tmp = "up";
+                if ( $options{test} > 1 ) {
+                    print "inserting scan not in the database on $port_tmp\n";
+                    print "mark 3\n";
+
+                }
+
+                insertServiceScan(
+                    {   host            => $host,
+                        mid             => $mid,
+                        port            => $port_tmp,
+                        proto           => $proto,
+                        state           => $state_tmp,
+                        proto           => $proto,
+                        updated         => $human_time,
+                        machine_updated => $machine_updated,
+                        change          => 1,
+                    }
+                );
+            }
+        }
+    }
+    else {
+
+     # handles ports that are open in the scan and don't exist in the database
+        foreach ( $host->udp_ports('open') ) {
+            my $tmptest = $host->udp_port_state($_);
+            if ( $options{test} eq 1 ) {
+                print "state is $tmptest\n";
+            }
+            next if ( $tmptest ne "open" );
+
+            my $port_tmp = $_;
+            my $state_tmp;
+            if ( $seen_ports{$port_tmp} && $seen_ports{$port_tmp} eq "up" ) {
+                if ( $options{test} eq 1 ) {
+                    print "Port is already up\n";
+                }
+            }
+            else {
+                $state_tmp = "up";
+                if ( $options{test} > 1 ) {
+                    print "inserting scan not in the database on $port_tmp\n";
+                    print "mark 4\n";
+                }
+                insertServiceScan(
+                    {   host            => $host,
+                        mid             => $mid,
+                        port            => $port_tmp,
+                        state           => $state_tmp,
+                        proto           => $proto,
+                        updated         => $human_time,
+                        machine_updated => $machine_updated,
+                        change          => 0,
+                    }
+                );
+            }
+        }
+    }
+}
+
+##############################################################################
+#
+# addServices: anoy hash ->
+# add service changes to the database
+#
+##############################################################################
+sub addServices {
+    my ($href) = @_;
+    die "addServices: mid not defined"     unless defined $href->{mid};
+    die "addServices: host not defined"    unless defined $href->{host};
+    die "addServices: updated not defined" unless defined $href->{updated};
+    die "addServices: uniq not defined"    unless defined $href->{uniq};
+    die "addServices: machine_updated not defined"
+        unless defined $href->{machine_updated};
+
+    my $host            = $href->{host};
+    my $human_time      = $href->{updated};
+    my $machine_updated = $href->{machine_updated};
+    my $mid             = $href->{mid};
+    my $uniq            = $href->{uniq};
+    my ( $port, $service, $banner, $state, $state_db );
+    my %port_db = sortDB(
+        {   host            => $host,
+            mid             => $mid,
+            updated         => $human_time,
+            machine_updated => $machine_updated
+        }
+    );
+
+    # determines all ports that are in the database and not in the scan
+    # thus we assume these services went down
+
+    if ( $uniq eq 0 ) {
+        if ( $options{test} > 0 ) {
+            print "store everything from the scan\n";
+        }
+        storeEverything(
+            {   host            => $host,
+                mid             => $mid,
+                updated         => $human_time,
+                machine_updated => $machine_updated
+            }
+        );
+        return 0;
+    }
+    my @tcp_ports = $host->tcp_open_ports();
+    my @udp_ports = $host->udp_open_ports();
+    if ( !defined( scalar(@tcp_ports) ) ) {
+        if ( $options{debug} > 0 or $options{test} eq 1 ) {
+            print "no TCP ports found\n";
+        }
+        setDown(
+            {   mid             => $mid,
+                host            => $host,
+                proto           => "tcp",
+                portdb          => \%port_db,
+                updated         => $human_time,
+                machine_updated => $machine_updated
+            }
+        );
+    }
+    else {
+        cmpAndInsert(
+            {   mid             => $mid,
+                host            => $host,
+                proto           => "tcp",
+                portdb          => \%port_db,
+                updated         => $human_time,
+                machine_updated => $machine_updated
+            }
+        );
+    }
+
+    if ( !defined( scalar(@udp_ports) ) ) {
+        if ( $options{debug} > 0 or $options{test} eq 1 ) {
+            print "no UDP ports found\n";
+        }
+        setDown(
+            {   mid             => $mid,
+                host            => $host,
+                proto           => "udp",
+                portdb          => \%port_db,
+                updated         => $human_time,
+                machine_updated => $machine_updated
+            }
+        );
+    }
+    else {
+        cmpAndInsert(
+            {   mid             => $mid,
+                host            => $host,
+                proto           => "udp",
+                portdb          => \%port_db,
+                updated         => $human_time,
+                machine_updated => $machine_updated
+            }
+        );
+    }
+}
+
+##############################################################################
+#
+# storeData: scalar ->
+# function to perform scans and insert hosts and services as needed
+#
+##############################################################################
+sub storeData {
+    my $mTable = createMachinesTable($dbh);
+    if ( $mTable eq 0 ) {
+        print "creating Machines Table\n";
+    }
+    my $sTable = createServicesTable($dbh);
+    if ( $sTable eq 0 ) {
+        print "creating Services Table\n";
+    }
+
+    my $created_on = $np->get_session()->finish_time();
+    my $human_time = localtime($created_on);
+
+    for my $host ( $np->all_hosts() ) {
+
+        my $os = $host->os_sig();
+        my $os_scan;
+        if (    defined($os)
+            and defined( $os->osfamily )
+            and defined( $os->osgen ) )
+        {
+            $os_scan = $os->osfamily . " " . $os->osgen;
+        }
+        else {
+            $os_scan = "unknown os";
+        }
+        if ( !defined($os_scan) or $os_scan eq "" ) {
+            $os_scan = "unknown os";
+        }
+
+        print "\n--------------------------------------\n";
+        print "Starting Scan of " . $host->addr . "\n";
+
+        my ( $mid, $uniq ) = addHost(
+            {   os              => $os_scan,
+                session         => $np->get_session(),
+                host            => $host,
+                created_on      => $human_time,
+                machine_created => $created_on
+            }
+        );
+        addServices(
+            {   mid             => $mid,
+                host            => $host,
+                updated         => $human_time,
+                machine_updated => $created_on,
+                uniq            => $uniq,
+            }
+        );
+
+        print "Scan Complete for " . $host->addr . "\n";
+        print "--------------------------------------\n";
+    }
+    print "\n";
+}
+
+##############################################################################
+#
+# verify_windows: array ref -> 
+# verify that the windows machine isn't trying to scanning itself
+# side effect: calls verify_scan and possibly quits
+#
+##############################################################################
+sub verify_windows {
+    my $range = shift;
+    foreach (@$range) {
+        if ( $_ =~ m/127\.0\.0\.1/ ) {
+            print "Error: Win32 machines can't scan themselves.\n";
+            exit 1;
+        }
+    }
+    verify_scan();
+}
+
+##############################################################################
+#
+# verify_ip: anoy hash -> scalar
+# determine if ip is in acceptable range
+#
+##############################################################################
+sub verify_ip {
+    my ($href) = @_;
+    die "verify_ip: oct1 not defined" unless defined $href->{oct1};
+    die "verify_ip: oct2 not defined" unless defined $href->{oct2};
+    die "verify_ip: oct3 not defined" unless defined $href->{oct3};
+    die "verify_ip: oct4 not defined" unless defined $href->{oct4};
+    my $oct1 = $href->{oct1};
+    my $oct2 = $href->{oct2};
+    my $oct3 = $href->{oct3};
+    my $oct4 = $href->{oct4};
+
+    if ( $oct1 < 255 and $oct1 > 0 ) {
+        if (   ( $oct2 eq "*" or $oct2 eq "\* " )
+            or ( $oct2 == 0 )
+            or ( $oct2 < 256 and $oct2 > 0 ) )
+        {
+            if (   ( $oct3 eq "*" or $oct3 eq "\*" )
+                or ( $oct3 == 0 )
+                or ( $oct3 < 256 and $oct3 > 0 ) )
+            {
+                if (   ( $oct4 eq "*" or $oct4 eq "\*" )
+                    or ( $oct4 =~ /0\/\d{1,2}/ )
+                    or ( $oct4 < 256 and $oct4 > 0 ) )
+                {
+                    return 1;
+                }
+                else {
+                    print "fourth is $4\n" if ( $options{test} > 2 );
+                }
+            }
+            else {
+                print "third is $3\n" if ( $options{test} > 2 );
+            }
+        }
+        else {
+            print "second is $2\n" if ( $options{test} > 3 );
+        }
+
+    }
+    return 0;
+}
+
+##############################################################################
+#
+# verify_scan
+# verifies that the nmap path is set
+# side effect: quits if the nmap path is not set 
+#
+##############################################################################
+sub verify_scan {
+    if ( !defined($nmapPath) or $nmapPath eq "" ) {
+        print "Error: Nmap was not found in your path.\n";
+        print "Please download the latest version from\n";
+        print "http://www.insecure.org/nmap/download.html\n";
+        exit 1;
+    }
+}
+##############################################################################
+#
+# help ->
+# display help information
+# side effect:  exits program
+#
+##############################################################################
+sub help {
+    print "Usage: $PROG [Options] {target specification}
+
+Target Specification:
+    Can pass hostnames, IP addresses, networks, etc.
+    Ex: microsoft.com, 192.168.0.1, 192.168.1.1/24, 10.0.0.1-254
+   -i  --iplist <iplist>     Scan using a list of IPs from a file
+   -x  --xml <xml-file>      Parse scan/info from Nmap XML file
+
+Scan Options:
+   -a  --args <args>         Execute Nmap with args (needs quotes)
+   -e  --extraargs <args>    Add args to the default args (needs quotes)
+       --inter <interface>   Perform Nmap Scan using non default interface
+   -m  --moreports <ports>   Add ports to scan ex: 8080 or 3306,5900
+   -n  --nmap <path>         Path to Nmap executable  
+   -p  --pingscan            Ping Target then scan the host(s) that are alive
+       --udp                 Add UDP to the scan arguments
+       --rpc                 Add RPC to the scan arguments
+   -r  --range <ports>       Ports for scan [def 1-1025]
+
+       --diffbanner          Parse changes of the banner
+                             
+Config Options:            
+   -d  --dbconfig <config>   Config for results database [def config.yaml]
+       --configdir <dir>     Directory for the database config file
+       
+       --data <file>         SQLite Database override [def data.dbl]
+       --dir <dir>           Directory for SQLite or CSV file [def . ]
+                             
+General Options:                
+       --nocolors            Don't Print Colors
+       --test <level>        Testing information
+       --debug <level>       Debug information
+   -v  --version             Display version
+   -h  --help                Display this information
+
+Send Comments to Joshua D. Abraham ( jabra\@ccs.neu.edu )\n";
+    exit;
+}
+
+##############################################################################
+#
+# print_version ->
+# displays version
+# side effect: exits program
+#
+##############################################################################
+sub print_version {
+    print "$PROG version $VERSION by $AUTH\n";
+    exit;
+}
+
+##############################################################################
+if ( @ARGV == 0 ) {
+    help;
+    exit;
+}
+GetOptions(
+    \%options,
+    'pingscan|p',    'scan|s', 'iplist|i=s', 'xml|x=s', 'range|r=s',
+    'moreports|m=s', 'nmap|n=s',
+    'dbconfig|d=s', 'dir=s', 'data=s', 'configdir=s', 'test=s',
+    'args|a=s', 'extraargs|e=s', 'udp', 'rpc', 'inter=s', 'diffbanner',
+    'help|h'       => sub { help(); },
+    'version|v'    => sub { print_version(); },
+    'nocolors'     => sub { $colors = 0; },
+    'fruitycolors' => sub { $colors = 2; },
+    'debug=s',
+    )
+    or exit 1;
+my $dephosts = "";
+if ($options{'scan'}){
+    print "WARNING: --scan is deprecated\n";
+    print "Please use the following format: $PROG 127.0.0.1 \n";
+    $dephosts = $options{'scan'};
+}
+if ( ( $options{'iplist'} or $options{'pingscan'} )
+    and $options{'xml'} )
+{
+    print "Invalid type of input\n";
+    exit 1;
+}
+if ( $options{'input'} and $options{'pingscan'} ) {
+    print "Conflicting type of Scan\n";
+}
+if ( $options{'dir'} ) {
+    $dir = $options{'dir'};
+}
+
+if ( $options{'configdir'} ) {
+    $configdir = $options{'configdir'};
+}
+
+if ( $options{'dbconfig'} ) {
+    my $tmpconfig;
+    if ( $^O eq 'MSWin32' || $^O =~ /cygwin/ ) {
+        $tmpconfig = $configdir . '\\' . $options{'dbconfig'};
+    }
+    else {
+        $tmpconfig = $configdir . "/" . $options{'dbconfig'};
+    }
+
+    if ( -e $tmpconfig && -r $tmpconfig ) {
+        $dbconfig = $tmpconfig;
+    }
+}
+chdir($dir) or die "Couldn't change to $dir directory\n";
+if (   !defined($dbconfig)
+    or $dbconfig eq ""
+    or ( !-e $dbconfig or !-r $dbconfig ) )
+{
+    print "Couldn't open $dbconfig for input\n";
+    exit;
+}
+
+if ( $options{'inter'} ) {
+    $interface = "-e " . $options{'inter'} . " ";
+}
+if ( $options{'nmap'} ) {
+    if ( -X $options{'nmap'} ) {
+        $nmapPath = $options{'nmap'};
+    }
+    else {
+        print $options{'nmap'} . " isn't executable using $nmapPath\n";
+    }
+}
+if ( $options{'iplist'} ) {
+    if ( -e $options{'iplist'} ) {
+        if ( -r $options{'iplist'} ) {
+            my $fh = new FileHandle("<$options{'iplist'}");
+            die "$options{'iplist'}:$!" unless defined $fh;
+            @ipRange = $fh->getlines();
+            chomp @ipRange;
+            $type = 'scan';
+        }
+        else {
+            print "File $options{'iplist'} isn't readable\n";
+            exit 1;
+        }
+    }
+    else {
+        print "File $options{'iplist'} doesn't exist\n";
+        exit 1;
+    }
+}
+
+if ( $options{'xml'} ) {
+    if ( -e $options{'xml'} ) {
+        if ( -r $options{'xml'} ) {
+            $xmlFile = $options{'xml'};
+            $type    = 'file';
+        }
+        else {
+            print "Input File isn't readable\n";
+            exit 1;
+        }
+    }
+    else {
+        print "Input File doesn't exist\n";
+        exit 1;
+    }
+}
+if ( $options{'udp'} ) {
+    $scantype = $scantype . "U";
+}
+if ( $options{'rpc'} ) {
+    $scantype = $scantype . "R";
+}
+
+if ( $options{'args'} ) {
+    $args     = "";
+    $scantype = "";
+    $args     = $options{'args'};
+    $cargs    = 'yes';
+}
+if ( $options{'extraargs'} ) {
+    $args = $args . $options{'extraargs'} . " ";
+}
+
+if ( $options{'dir'} ) {
+    $outputdir = $options{'dir'};
+}
+
+if ( $options{'range'} ) {
+    my (@ports) = split ',', $options{'range'};
+    foreach (@ports) {
+        chomp;
+        if ( $_ !~ /\d/ ) {
+            print "$_ not digit\n";
+        }
+    }
+    $Range = "";
+    for ( my $i = 0; $i < scalar(@ports); $i++ ) {
+        $Range .= $ports[$i];
+        if ( $i < scalar(@ports) - 1 ) {
+            $Range .= ",";
+        }
+    }
+}
+
+#@ports = @ports  - 1;
+if ( $options{'moreports'} ) {
+    my @morePorts = split ',', $options{'moreports'};
+    foreach (@morePorts) {
+        if (/(\d+)/) {
+            chomp;
+            if ( $_ =~ /\d/ ) {
+                $Range .= ",$_";
+            }
+            else {
+                print "MorePorts: Port $_ isn't between 1 and 65535\n";
+                exit 1;
+            }
+        }
+        else {
+            print "MorePorts: Port $_ isn't a number\n";
+            exit 1;
+        }
+    }
+}
+if ( $options{'diffbanner'} ) {
+    $diff = "banner";
+}
+my $tmp = scalar(@ARGV);
+my @targets;
+if ( $type ne 'file' ) {
+    foreach (@ARGV) {
+        s/\ //g;
+        my @args = split(',', $_);
+        foreach(@args){
+            push( @targets, $_ );
+        }
+    }
+    my @args = split(',', $dephosts);
+    foreach(@args){
+       push( @targets, $_ );
+    }
+}
+foreach my $host (@targets) {
+    if ($host) {
+        my $ipRange;
+        if ( $host =~ /[a-zA-Z]/ ) {
+            my $name = $host;
+            if ( $name eq 'localhost' ) {
+                $ipRange = '127.0.0.1';
+            }
+            else {
+                my ( $host, @addresses, $hent, $addr_ref );
+                if ( $hent = gethostbyname($name) ) {
+                    $name     = $hent->name();        # in case different
+                    $addr_ref = $hent->addr_list();
+                    @addresses = map { inet_ntoa($_) } @$addr_ref;
+                }
+                $ipRange = $addresses[0];
+                if ( !defined($ipRange) or $ipRange eq '' ) {
+                    print "Invalid Ip Address being Resolved\n";
+                    exit 1;
+                }
+            }
+            print "Resolved $host to $ipRange\n"
+                if ( $options{debug} > 3 );
+            $type = 'scan';
+            push( @ipRange, $ipRange );
+        }
+
+        elsif ( $host
+            =~ /(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\-(\d{1,3}|\*|'*')/
+            )
+        {
+            my $max;
+            if ( $5 =~ m/\*/ ) {
+                $max = 255;
+            }
+            elsif ( $5 < 256 ) {
+                $max = $5;
+            }
+            else {
+                print "IP Address not in proper range\n";
+                exit 1;
+            }
+            if ( $4 < $5 ) {
+                for ( $4 .. $max ) {
+                    if (verify_ip(
+                            {   oct1 => $1,
+                                oct2 => $2,
+                                oct3 => $3,
+                                oct4 => $_
+                            }
+                        ) == 1
+                        )
+                    {
+                        my $ip = join( ".", $1, $2, $3, $_ );
+                        push( @ipRange, $ip );
+                        $type = 'scan';
+                    }
+                }
+            }
+        }
+
+        elsif ( $host
+            =~ /(\d{1,3})\.(\d{1,3}|\*)\.(\d{1,3}|\*)\.(0\/\d{1,2}|\d{1,3}|\*|'*')/
+            )
+        {
+            if ( $options{test} > 3 ) {
+                print "first is $1\n";
+                print "second is $2\n";
+                print "third is $3\n";
+                print "fourth is $4\n";
+            }
+            my $valid = verify_ip(
+                {   oct1 => $1,
+                    oct2 => $2,
+                    oct3 => $3,
+                    oct4 => $4
+                }
+            );
+            if ( $valid == 1 ) {
+                $type = 'scan';
+                push( @ipRange, $host );
+            }
+        }
+        if ( !defined($host) ) {
+            print "IP Address not in proper range\n";
+            exit 1;
+        }
+    }
+    else {
+        print "Invalid IP Address\n";
+        exit 1;
+        print "scan is $host" if ( $options{debug} eq 1 );
+    }
+}
+
+if ( $options{'pingscan'} ) {
+    if ( $^O eq 'MSWin32' || $^O =~ /cygwin/ ) {
+        $nmapPath = "\"$nmapPath\"";
+        verify_windows( \@ipRange );
+    }
+    else {
+        verify_scan();
+    }
+    $np->parsescan( $nmapPath, "-R -sP", @ipRange );
+    my $livehosts = "";
+    for my $host ( $np->get_ips('up') ) {
+        if ( $livehosts eq "" ) {
+            $livehosts = $host;
+        }
+        else {
+            $livehosts = join( " ", $livehosts, $host );
+        }
+    }
+    if ( $livehosts eq "" ) {
+        print "Scanned @ipRange\n";
+        print "No Hosts Responding to Ping Scan\n";
+        exit;
+    }
+    else {
+        print "Live Hosts Found: $livehosts\n";
+        @ipRange = $livehosts;
+    }
+}
+
+# make sure something is passed
+help() if ( $type ne 'file' and $type ne 'scan' );
+
+if ( $type eq 'file' ) {
+    $np->parsefile($xmlFile);
+}
+elsif ( $type eq 'scan' ) {
+    $args = $args . $interface;
+    if ( $cargs eq 'no' ) {
+        $args = $args . $scantype . " -p $Range";
+    }
+    if ( $options{debug} > 2 or $options{test} > 0 ) {
+        print "nmap path is $nmapPath\n";
+    }
+    if ( $args =~ /-o(?:X|N|G)/ ) {
+        warn "$PROG Cannot pass option '-oX', '-oN' or '-oG'\n";
+        warn "Removing option\n";
+        $args =~ s/-o(?:X|N|G)//g;
+        print "args is now $args\n";
+    }
+    if ( $^O eq 'MSWin32' || $^O =~ /cygwin/ ) {
+        $nmapPath = "\"$nmapPath\"";
+        verify_windows( \@ipRange );
+    }
+    else {
+        verify_scan();
+        if ( $> ne 0 ) {
+            print "PBNJ Scans requires root privileges.\n";
+            exit 1;
+        }
+    }
+    if ( $options{debug} > 0 or $options{test} > 0 ) {
+        print "Scan Args are $args\n";
+        print "Scanning ";
+        foreach (@ipRange) { print "-  $_ "; }
+        print "\n";
+    }
+    $np->parsescan( $nmapPath, $args, @ipRange );
+}
+else {
+    print "type error $type\n";
+    exit 1;
+}
+
+# only connect to the database when we need too.
+if ( $type eq "scan" or $type eq "file" ) {
+    if ( $options{data} ) {
+        $db       = "SQLite";
+        $database = $options{data};
+    }
+    else {
+        $datadb = YAML::LoadFile($dbconfig);
+
+        foreach my $tmp ( keys %$datadb ) {
+            $passwd   = $$datadb{$tmp} if ( $tmp eq 'passwd' );
+            $user     = $$datadb{$tmp} if ( $tmp eq 'user' );
+            $db       = $$datadb{$tmp} if ( $tmp eq 'db' );
+            $database = $$datadb{$tmp} if ( $tmp eq 'database' );
+            $hostname = $$datadb{$tmp} if ( $tmp eq 'host' );
+            $port     = $$datadb{$tmp} if ( $tmp eq 'port' );
+        }
+    }
+
+    # connection to database
+    if ( $db eq 'SQLite' or $db eq 'CSV' ) {
+        $dbh = DBI->connect(
+            "dbi:$db:$database",
+            $user, $passwd,
+            {   PrintError => 0,
+                RaiseError => 0,
+                AutoCommit => 1
+            }
+            )
+            || die "Cannot connect: $DBI::errstr";
+    }
+    elsif ( $db eq 'mysql' ) {
+        my $dsn = "DBI:$db:database=$database;host=$hostname;port=$port";
+        $dbh = DBI->connect(
+            $dsn, $user, $passwd,
+            {   PrintError => 0,
+                RaiseError => 0,
+                AutoCommit => 1
+            }
+            )
+            || die "Cannot connect: $DBI::errstr";
+    }
+    elsif ( $db eq 'Pg' ) {
+        my $dsn = "DBI:$db:database=$database;host=$hostname;port=$port";
+        $dbh = DBI->connect(
+            $dsn, $user, $passwd,
+            {   PrintError => 0,
+                RaiseError => 0,
+                AutoCommit => 1,
+                PrintWarn  => 0
+            }
+            )
+            || die "Cannot connect: $DBI::errstr";
+    }
+    else {
+        print "$db isn't supported\n";
+    }
+}
+
+storeData($dbh);
+
+$dbh->disconnect;
+
+__DATA__
+# Config.yaml
+#
+
+# Copyright (C) 2005-2006 Joshua D. Abraham ( jabra@ccs.neu.edu )
+#
+# This config file is released under the terms of the GNU General
+# Public License (GPL), which is distributed with this software in the
+# file "COPYING".  The GPL specifies the terms under which users
+# may copy and use this software.
+#
+# PBNJ 2.0
+# (P)orts (B)anners N' (J)unk
+# 
+# Author:   Joshua D. Abraham
+# Date:     March 15, 2006
+# Updated:  November 15, 2006
+# Version:  2.04
+#
+# Configuration file for PBNJ 2.0
+# YAML:1.0
+#
+# Config for connecting to a DBI database
+# SQLite, mysql etc
+
+db: SQLite
+# for SQLite the name of the file. For mysql the name of the database
+database: data.dbl
+# Username for the database. For SQLite no username is needed.
+user: ""
+# Password for the database. For SQLite no password is needed.
+passwd: ""
+# Password for the database. For SQLite no host is needed.
+host: ""
+# Port for the database. For SQLite no port is needed.
+port: ""
